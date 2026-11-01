@@ -33,50 +33,72 @@ def main():
     wb = openpyxl.load_workbook(INPUT_EXCEL)
     ws = wb[SHEET_NAME] if SHEET_NAME in wb.sheetnames else wb.active
 
-    # Add header row
-    headers = [
-        (2, "Overall_Status"),
-        (3, "Match_Count"),
-        (4, "Consolidated_Notes"),
-        (5, "Rajpal_Status"),
-        (6, "Rajpal_Entry"),
-        (7, "Hindwi_Status"),
-        (8, "Hindwi_Card_Word"),
-        (9, "Hindwi_Meaning"),
-        (10, "HinKhoj_Status"),
-        (11, "HinKhoj_Card_Word"),
-        (12, "HinKhoj_Meaning"),
-        (13, "Shabdkosh_Status"),
-        (14, "Shabdkosh_H1_Word"),
-        (15, "Shabdkosh_Meaning"),
-    ]
-    for col_idx, h_name in headers:
-        ws.cell(row=1, column=col_idx, value=h_name)
+    # Create a fresh clean workbook for the output
+    out_wb = openpyxl.Workbook()
+    out_ws = out_wb.active
+    out_ws.title = "Validated_words"
 
-    # Populate rows
+    # Define headers
+    headers = [
+        "Word",
+        "Overall_Status",
+        "Mismatch_Type",
+        "Match_Count",
+        "Consolidated_Notes",
+        "Rajpal_Status",
+        "Rajpal_Entry",
+        "Hindwi_Status",
+        "Hindwi_Card_Word",
+        "Hindwi_Meaning",
+        "HinKhoj_Status",
+        "HinKhoj_Card_Word",
+        "HinKhoj_Meaning",
+        "Shabdkosh_Status",
+        "Shabdkosh_H1_Word",
+        "Shabdkosh_Meaning"
+    ]
+    out_ws.append(headers)
+
+    # Populate rows, dropping multi-word phrases with spaces
+    dropped_space_phrases = 0
+    written_rows = 0
+
     for r_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
         if r_idx == 1 or not row or not row[0]:
             continue
         w = str(row[0]).strip()
-        data = all_records.get(w)
-        if data:
-            ws.cell(row=r_idx, column=2, value=data.get('Overall_Status', ''))
-            ws.cell(row=r_idx, column=3, value=data.get('Match_Count', ''))
-            ws.cell(row=r_idx, column=4, value=data.get('Consolidated_Notes', ''))
-            ws.cell(row=r_idx, column=5, value=data.get('Rajpal_Status', ''))
-            ws.cell(row=r_idx, column=6, value=data.get('Rajpal_Entry', ''))
-            ws.cell(row=r_idx, column=7, value=data.get('Hindwi_Status', ''))
-            ws.cell(row=r_idx, column=8, value=data.get('Hindwi_Card_Word', ''))
-            ws.cell(row=r_idx, column=9, value=data.get('Hindwi_Meaning', ''))
-            ws.cell(row=r_idx, column=10, value=data.get('HinKhoj_Status', ''))
-            ws.cell(row=r_idx, column=11, value=data.get('HinKhoj_Card_Word', ''))
-            ws.cell(row=r_idx, column=12, value=data.get('HinKhoj_Meaning', ''))
-            ws.cell(row=r_idx, column=13, value=data.get('Shabdkosh_Status', ''))
-            ws.cell(row=r_idx, column=14, value=data.get('Shabdkosh_H1_Word', ''))
-            ws.cell(row=r_idx, column=15, value=data.get('Shabdkosh_Meaning', ''))
+        
+        # User rule: remove phrases with spaces like 'राष्ट्रीय पक्षी'
+        if ' ' in w:
+            dropped_space_phrases += 1
+            continue
 
-    wb.save(OUTPUT_EXCEL)
-    print(f"\n[SUCCESS] Successfully merged all shards into: '{OUTPUT_EXCEL}'!")
+        data = all_records.get(w, {})
+        row_values = [
+            w,
+            data.get('Overall_Status', 'PENDING'),
+            data.get('Mismatch_Type', ''),
+            data.get('Match_Count', ''),
+            data.get('Consolidated_Notes', ''),
+            data.get('Rajpal_Status', ''),
+            data.get('Rajpal_Entry', ''),
+            data.get('Hindwi_Status', ''),
+            data.get('Hindwi_Card_Word', ''),
+            data.get('Hindwi_Meaning', ''),
+            data.get('HinKhoj_Status', ''),
+            data.get('HinKhoj_Card_Word', ''),
+            data.get('HinKhoj_Meaning', ''),
+            data.get('Shabdkosh_Status', ''),
+            data.get('Shabdkosh_H1_Word', ''),
+            data.get('Shabdkosh_Meaning', '')
+        ]
+        out_ws.append(row_values)
+        written_rows += 1
+
+    out_wb.save(OUTPUT_EXCEL)
+    print(f"\n[SUCCESS] Successfully merged results into '{OUTPUT_EXCEL}'!")
+    print(f"Total words written: {written_rows}")
+    print(f"Multi-word phrases removed: {dropped_space_phrases}")
 
 
 if __name__ == '__main__':

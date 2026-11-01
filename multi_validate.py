@@ -36,6 +36,18 @@ HEADERS = {
 csv_lock = threading.Lock()
 
 
+def strip_nukta(text):
+    """Strips Devanagari nukta (U+093C) to detect phonetic loanword variations."""
+    decomposed = unicodedata.normalize('NFD', text)
+    stripped = ''.join(c for c in decomposed if c != '\u093c')
+    return unicodedata.normalize('NFC', stripped)
+
+
+def strip_nasal(text):
+    """Normalizes anusvara and chandrabindu."""
+    return unicodedata.normalize('NFC', text).replace('\u0901', '\u0902')
+
+
 def get_retry_session():
     """Create requests session with robust retry logic."""
     session = requests.Session()
@@ -89,13 +101,20 @@ def check_rajpal(word, rajpal_index):
         meaning = entry.split('-', 1)[1].strip() if '-' in entry else entry
         return "OKAY", norm_w, meaning
         
-    # Check alternate spelling (e.g. anusvara vs chandrabindu)
-    alt_cand = norm_w.replace('\u0901', '\u0902') if '\u0901' in norm_w else norm_w.replace('\u0902', '\u0901')
-    entry_alt = rajpal_index.get(alt_cand)
-    if entry_alt:
-        m_alt = entry_alt.split('-', 1)[1].strip() if '-' in entry_alt else entry_alt
-        return "MISMATCH", alt_cand, m_alt
-        
+    # Check alternate spelling with/without nukta
+    w_no_nukta = strip_nukta(norm_w)
+    for k, v in rajpal_index.items():
+        if strip_nukta(k) == w_no_nukta:
+            meaning = v.split('-', 1)[1].strip() if '-' in v else v
+            return "NUKTA_VARIANT", k, meaning
+
+    # Check alternate spelling with anusvara / chandrabindu
+    w_nasal = strip_nasal(norm_w)
+    for k, v in rajpal_index.items():
+        if strip_nasal(k) == w_nasal:
+            meaning = v.split('-', 1)[1].strip() if '-' in v else v
+            return "NASAL_VARIANT", k, meaning
+
     return "NOT_FOUND", "", ""
 
 
@@ -124,7 +143,16 @@ def check_hindwi(session, word):
                 
                 norm_w = unicodedata.normalize('NFC', word.strip())
                 norm_card = unicodedata.normalize('NFC', card_word.strip())
-                status = "OKAY" if norm_w == norm_card else "MISMATCH"
+                
+                if norm_w == norm_card:
+                    status = "OKAY"
+                elif strip_nukta(norm_w) == strip_nukta(norm_card):
+                    status = "NUKTA_VARIANT"
+                elif strip_nasal(norm_w) == strip_nasal(norm_card):
+                    status = "NASAL_VARIANT"
+                else:
+                    status = "MISMATCH"
+                    
                 return status, card_word, meaning
         return "NOT_FOUND", "", ""
     except Exception as e:
@@ -155,7 +183,16 @@ def check_hinkhoj(session, word):
             
             norm_w = unicodedata.normalize('NFC', word.strip())
             norm_card = unicodedata.normalize('NFC', card_word.strip())
-            status = "OKAY" if norm_w == norm_card else "MISMATCH"
+            
+            if norm_w == norm_card:
+                status = "OKAY"
+            elif strip_nukta(norm_w) == strip_nukta(norm_card):
+                status = "NUKTA_VARIANT"
+            elif strip_nasal(norm_w) == strip_nasal(norm_card):
+                status = "NASAL_VARIANT"
+            else:
+                status = "MISMATCH"
+                
             return status, card_word, meaning_str
         return "NOT_FOUND", "", ""
     except Exception as e:
@@ -184,15 +221,118 @@ def check_shabdkosh(session, word):
             
             norm_w = unicodedata.normalize('NFC', word.strip())
             norm_h1 = unicodedata.normalize('NFC', h1_word.strip())
-            status = "OKAY" if norm_w == norm_h1 else "MISMATCH"
+            
+            if norm_w == norm_h1:
+                status = "OKAY"
+            elif strip_nukta(norm_w) == strip_nukta(norm_h1):
+                status = "NUKTA_VARIANT"
+            elif strip_nasal(norm_w) == strip_nasal(norm_h1):
+                status = "NASAL_VARIANT"
+            else:
+                status = "MISMATCH"
+                
             return status, h1_word, meaning_str
         return "NOT_FOUND", "", ""
     except Exception as e:
         return "ERROR", "", str(e)
 
 
-def validate_word(session, rajpal_index, row_num, word):
-    """Validates word across all 4 sources and determines consolidated status."""
+def classify_mismatch(word, statuses, headwords, found_count):
+    """Determines the specific Mismatch_Type column value."""
+    norm_w = unicodedata.normalize('NFC', word.strip())
+    
+    # Non-matching headwords only
+    differing_hws = [
+        unicodedata.normalize('NFC', hw.strip())
+        for hw in headwords
+        if hw and unicodedata.normalize('NFC', hw.strip()) != norm_w
+    ]
+    
+    # 1. Nukta mismatch check
+    if any(s == "NUKTA_VARIANT" for s in statuses):
+        return "Nukta_Mismatch"
+    for hw in differing_hws:
+        if strip_nukta(norm_w) == strip_nukta(hw):
+            return "Nukta_Mismatch"
+            
+    # 2. Nasalization mismatch check (Anusvara vs Chandrabindu)
+    if any(s == "NASAL_VARIANT" for s in statuses):
+        return "Nasalization_Mismatch"
+    for hw in differing_hws:
+        if strip_nasal(norm_w) == strip_nasal(hw):
+            return "Nasalization_Mismatch"
+            
+    # 3. Inflection to Lemma (dictionary returned verbal infinitive ending in 'ना')
+    for hw in differing_hws:
+        if hw.endswith('ना') and not norm_w.endswith('ना'):
+            return "Inflection_To_Lemma"
+            
+    # 4. Compound or Idiom
+    for hw in differing_hws:
+        if ' ' in hw or '-' in hw:
+            return "Compound_Or_Idiom"
+            
+    # 5. Not found in any dictionary
+    if found_count == 0:
+        return "Not_Found_In_All"
+        
+    return ""
+
+
+def validate_word(session, rajpal_index, row_num, word, single_vocab):
+    """Validates word across all 4 sources with fast-track compound checks."""
+    norm_w = unicodedata.normalize('NFC', word.strip())
+    
+    # Check 1: Identical reduplication (e.g. छोटी-छोटी, अंग-अंग)
+    if '-' in norm_w:
+        parts = norm_w.split('-')
+        if len(parts) == 2 and parts[0].strip() == parts[1].strip() and parts[0].strip():
+            base = parts[0].strip()
+            return {
+                'Index': row_num,
+                'Word': word,
+                'Overall_Status': "OKAY",
+                'Mismatch_Type': "",
+                'Match_Count': "4/4",
+                'Consolidated_Notes': f"Auto-verified: Reduplication of '{base}'",
+                'Rajpal_Status': "AUTO_REDUPLICATION",
+                'Rajpal_Entry': f"Reduplication of {base}",
+                'Hindwi_Status': "AUTO_REDUPLICATION",
+                'Hindwi_Card_Word': norm_w,
+                'Hindwi_Meaning': f"Repetition of {base}",
+                'HinKhoj_Status': "AUTO_REDUPLICATION",
+                'HinKhoj_Card_Word': norm_w,
+                'HinKhoj_Meaning': f"Repetition of {base}",
+                'Shabdkosh_Status': "AUTO_REDUPLICATION",
+                'Shabdkosh_H1_Word': norm_w,
+                'Shabdkosh_Meaning': f"Repetition of {base}"
+            }
+            
+        # Check 2: Compound pair where both words already exist in corpus vocabulary
+        if len(parts) == 2:
+            p1, p2 = parts[0].strip(), parts[1].strip()
+            if p1 in single_vocab and p2 in single_vocab:
+                return {
+                    'Index': row_num,
+                    'Word': word,
+                    'Overall_Status': "OKAY",
+                    'Mismatch_Type': "",
+                    'Match_Count': "4/4",
+                    'Consolidated_Notes': f"Auto-verified: Compound constituents '{p1}' & '{p2}' exist in corpus",
+                    'Rajpal_Status': "AUTO_COMPOUND",
+                    'Rajpal_Entry': f"Compound of '{p1}' and '{p2}'",
+                    'Hindwi_Status': "AUTO_COMPOUND",
+                    'Hindwi_Card_Word': norm_w,
+                    'Hindwi_Meaning': f"Compound word: {p1} + {p2}",
+                    'HinKhoj_Status': "AUTO_COMPOUND",
+                    'HinKhoj_Card_Word': norm_w,
+                    'HinKhoj_Meaning': f"Compound word: {p1} + {p2}",
+                    'Shabdkosh_Status': "AUTO_COMPOUND",
+                    'Shabdkosh_H1_Word': norm_w,
+                    'Shabdkosh_Meaning': f"Compound word: {p1} + {p2}"
+                }
+
+    # Query all 4 sources
     # 1. Rajpal (instant local lookup)
     r_stat, r_word, r_mean = check_rajpal(word, rajpal_index)
     
@@ -205,28 +345,43 @@ def validate_word(session, rajpal_index, row_num, word):
     # 4. Shabdkosh
     sk_stat, sk_word, sk_mean = check_shabdkosh(session, word)
     
-    # Check match count
-    match_count = sum(1 for s in [r_stat, hw_stat, hk_stat, sk_stat] if s == "OKAY")
+    statuses = [r_stat, hw_stat, hk_stat, sk_stat]
+    headwords = [r_word, hw_word, hk_word, sk_word]
     
+    # Primary gate: exact match count
+    match_count = sum(1 for s in statuses if s == "OKAY")
+    found_count = sum(1 for s in statuses if s not in ["NOT_FOUND", "ERROR"])
+    
+    # Overall Status decision
     if match_count == 4:
         overall_status = "OKAY"
+        mismatch_type = ""
         consolidated_note = "OKAY: Confirmed in all 4 sources"
     elif match_count >= 2:
         overall_status = "PARTIAL_MATCH"
+        mismatch_type = classify_mismatch(word, statuses, headwords, found_count)
         notes = []
         if r_stat != "OKAY" and r_word: notes.append(f"Rajpal: {r_word}")
         if hw_stat != "OKAY" and hw_word: notes.append(f"Hindwi: {hw_word}")
         if hk_stat != "OKAY" and hk_word: notes.append(f"HinKhoj: {hk_word}")
         if sk_stat != "OKAY" and sk_word: notes.append(f"Shabdkosh: {sk_word}")
-        consolidated_note = f"Matches {match_count}/4. Differs in: " + (", ".join(notes) if notes else "N/A")
+        tag = f" [{mismatch_type}]" if mismatch_type else ""
+        consolidated_note = f"Matches {match_count}/4{tag}. Differs in: " + (", ".join(notes) if notes else "N/A")
+    elif found_count == 0:
+        overall_status = "NOT_FOUND"
+        mismatch_type = "Not_Found_In_All"
+        consolidated_note = "Not found in any of the 4 sources"
     else:
         overall_status = "MISMATCH"
-        consolidated_note = f"Matches {match_count}/4. Low consensus across sources"
+        mismatch_type = classify_mismatch(word, statuses, headwords, found_count)
+        tag = f" [{mismatch_type}]" if mismatch_type else ""
+        consolidated_note = f"Matches {match_count}/4{tag}. Low consensus across sources"
         
     return {
         'Index': row_num,
         'Word': word,
         'Overall_Status': overall_status,
+        'Mismatch_Type': mismatch_type,
         'Match_Count': f"{match_count}/4",
         'Consolidated_Notes': consolidated_note,
         'Rajpal_Status': r_stat,
@@ -265,7 +420,7 @@ def append_shard_batch(progress_csv, batch):
     with csv_lock:
         file_exists = os.path.exists(progress_csv) and os.path.getsize(progress_csv) > 0
         fieldnames = [
-            'Index', 'Word', 'Overall_Status', 'Match_Count', 'Consolidated_Notes',
+            'Index', 'Word', 'Overall_Status', 'Mismatch_Type', 'Match_Count', 'Consolidated_Notes',
             'Rajpal_Status', 'Rajpal_Entry',
             'Hindwi_Status', 'Hindwi_Card_Word', 'Hindwi_Meaning',
             'HinKhoj_Status', 'HinKhoj_Card_Word', 'HinKhoj_Meaning',
@@ -299,16 +454,26 @@ def main():
     ws = wb[SHEET_NAME] if SHEET_NAME in wb.sheetnames else wb.active
     
     all_words = []
+    dropped_space_count = 0
     for r_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
-        if r_idx == 1:
-            continue  # header
-        if not row or not row[0]:
+        if r_idx == 1 or not row or not row[0]:
             continue
         w = str(row[0]).strip()
+        
+        # Rule: Filter out multi-word phrases with spaces (e.g. 'राष्ट्रीय पक्षी')
+        if ' ' in w:
+            dropped_space_count += 1
+            continue
+            
         all_words.append((r_idx, w))
 
+    print(f"Total vocabulary words to process: {len(all_words)} (dropped {dropped_space_count} multi-word phrases with spaces)")
+
+    # Build single-word vocabulary for compound pair fast-tracking
+    single_vocab = {unicodedata.normalize('NFC', w) for _, w in all_words if '-' not in w}
+    print(f"Single-word base vocabulary count: {len(single_vocab)}")
+
     total_words = len(all_words)
-    print(f"Total words in corpus: {total_words}")
 
     # 2. Slice shard
     chunk_size = (total_words + args.total_shards - 1) // args.total_shards
@@ -344,8 +509,10 @@ def main():
     def process_item(item):
         s = get_session()
         r_num, w = item
-        res = validate_word(s, rajpal_index, r_num, w)
-        time.sleep(0.2)  # polite pause
+        res = validate_word(s, rajpal_index, r_num, w, single_vocab)
+        # Polite pause only if HTTP request was actually made (not auto-compound/reduplication)
+        if not res['Rajpal_Status'].startswith('AUTO_'):
+            time.sleep(0.2)
         return res
 
     batch = []
@@ -365,7 +532,8 @@ def main():
             if completed_in_shard % 10 == 0 or completed_in_shard == len(shard_words):
                 elapsed = time.time() - t_start
                 rate = (completed_in_shard - len(checkpoint) + len(batch)) / elapsed if elapsed > 0 else 0
-                print(f"[Shard {args.shard_id}] [{completed_in_shard}/{len(shard_words)}] '{w:12s}' -> {res['Overall_Status']:14s} ({res['Match_Count']}) | Speed: {rate:.1f} w/s")
+                tag = f" [{res['Mismatch_Type']}]" if res['Mismatch_Type'] else ""
+                print(f"[Shard {args.shard_id}] [{completed_in_shard}/{len(shard_words)}] '{w:12s}' -> {res['Overall_Status']:14s}{tag} ({res['Match_Count']}) | Speed: {rate:.1f} w/s")
 
             if len(batch) >= SAVE_INTERVAL:
                 append_shard_batch(progress_csv, batch)
