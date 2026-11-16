@@ -2,13 +2,6 @@ name: 5-Bot Multi-Source Corpus Enrichment (Rekhta & Shabdkosh)
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - 'enrich_validate.py'
-      - 'corpus_ready_for_enrichment.xlsx'
-      - '.github/workflows/enrich_matrix.yml'
 
 permissions:
   contents: write
